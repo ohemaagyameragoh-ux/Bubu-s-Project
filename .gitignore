@@ -1,0 +1,34 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next
+/out
+
+# production
+/build
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# prisma local database (do not commit data)
+/prisma/*.db
+/prisma/*.db-journal
+
+# embedded local postgres data directory
+/.pgdata
+
+# env files (never commit secrets)
+.env
+.env.local
+.env*.local
+
+# os
+.DS_Store
+
+# logs
+*.log
+
+# CI workflow excluded from push (token needs the Workflows permission to include it)
+/.github/workflows/ci.yml

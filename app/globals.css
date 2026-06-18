@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  background-color: theme("colors.paper");
+  color: theme("colors.ink");
+  font-family: theme("fontFamily.sans");
+}
+
+/* Small uppercase label used on cards and table headers. */
+.label-caps {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: theme("colors.muted");
+}
+
+/* Readable rendering for long text bodies (notes, descriptions). */
+.prose-simple {
+  white-space: pre-wrap;
+  line-height: 1.7;
+}
+
+a {
+  text-underline-offset: 3px;
+}

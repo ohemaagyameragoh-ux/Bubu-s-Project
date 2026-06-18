@@ -1,0 +1,828 @@
+// Commodity Trading Platform: data model.
+// Milestone 0 (Foundation) scope only. Later milestones add their own models.
+// Rule: no em dashes anywhere, including comments. Use commas, periods, parentheses, or colons.
+//
+// Multi-tenancy: every tenant-owned row carries a non-null tenantId with an index.
+// The tenant-scoping happens in code (see lib/tenant-db.ts), not here, but the columns
+// and indexes that make it safe and fast live in this schema.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// Workspace roles inside a tenant. The platform operator (super admin) is modeled
+// separately on User.isPlatformAdmin, since that account sits outside any tenant.
+enum Role {
+  ADMIN
+  SALES
+  PROCUREMENT
+  LOGISTICS
+  FINANCE
+}
+
+enum CounterpartyType {
+  CLIENT
+  FARMER
+  TRANSPORTER
+}
+
+// How the trader is acting on a given trade. This choice decides which fields are required and
+// which report the result lands in: profit and loss for owned trades, commission for brokered.
+enum TradeMode {
+  OWNER
+  BROKER
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+}
+
+enum DeliveryStatus {
+  PENDING
+  IN_TRANSIT
+  DELIVERED
+}
+
+// The derived lifecycle of a trade. Stored denormalized so the dashboard can filter on it, but
+// always computed from payment and delivery state (or a manual override) in the service layer.
+enum Lifecycle {
+  ACTIVE
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+// A tenant is one trader's private workspace. Everything tenant-owned points back here.
+model Tenant {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  legalName String?
+  logoUrl   String?
+  email     String?
+  phone     String?
+  address   String?
+  currency  String   @default("GHS")
+  plan      String   @default("free")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users          User[]
+  commodities    Commodity[]
+  counterparties Counterparty[]
+  transactions   Transaction[]
+  leads          Lead[]
+  quotes         Quote[]
+  orders         Order[]
+  lots           InventoryLot[]
+  purchases      FarmerPurchase[]
+  trips          Trip[]
+  haulageRequests HaulageRequest[]
+  listings       MarketplaceListing[]
+  pricePoints    PricePoint[]
+  invoices       Invoice[]
+  payments       Payment[]
+  ledgerEntries  LedgerEntry[]
+  bankStatements BankStatement[]
+  integrations   IntegrationCredential[]
+  auditLogs      AuditLog[]
+
+  @@index([slug])
+}
+
+// A person who can sign in. Tenant users have a tenantId and a role.
+// The platform operator has isPlatformAdmin true, a null tenantId, and a null role.
+// Email is globally unique to keep credential login simple in M0.
+model User {
+  id             String   @id @default(cuid())
+  email          String   @unique
+  name           String
+  passwordHash   String
+  role           Role?
+  isPlatformAdmin Boolean @default(false)
+  tenantId       String?
+  tenant         Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([tenantId])
+}
+
+// A commodity the tenant trades (maize, soya, rice, and so on). Nothing is locked to one crop.
+model Commodity {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name        String
+  description String   @default("")
+  baseUnit    String   @default("kg")
+  units       String[] @default([])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  grades        CommodityGrade[]
+  qualityParams QualityParameter[]
+  transactions  Transaction[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+// A quality tier for a commodity, for example Grade A or Grade B.
+model CommodityGrade {
+  id          String    @id @default(cuid())
+  tenantId    String
+  commodityId String
+  commodity   Commodity @relation(fields: [commodityId], references: [id], onDelete: Cascade)
+  name        String
+  description String    @default("")
+  order       Int       @default(0)
+
+  @@index([tenantId])
+  @@index([commodityId])
+}
+
+// A measured quality attribute for a commodity, for example moisture or foreign matter.
+model QualityParameter {
+  id            String    @id @default(cuid())
+  tenantId      String
+  commodityId   String
+  commodity     Commodity @relation(fields: [commodityId], references: [id], onDelete: Cascade)
+  name          String
+  unit          String    @default("%")
+  maxAcceptable Float?
+  order         Int       @default(0)
+
+  @@index([tenantId])
+  @@index([commodityId])
+}
+
+// A party the tenant deals with. Farmers and transporters are subtypes of counterparty.
+model Counterparty {
+  id        String           @id @default(cuid())
+  tenantId  String
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  type      CounterpartyType
+  name      String
+  phone     String?
+  email     String?
+  location  String?
+  notes     String           @default("")
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  @@index([tenantId])
+  @@index([tenantId, type])
+}
+
+// An append-only record of money-related and sensitive actions: who did what, and when.
+model AuditLog {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, createdAt])
+}
+
+// The core record of the platform: one trade, captured in either the owner-trader or broker mode.
+// Owner trades carry buy and sell prices and a capital source. Broker trades carry a commission.
+// The grade and commodity name are kept as snapshots so history stays readable even if the
+// commodity setup changes later.
+model Transaction {
+  id            String         @id @default(cuid())
+  tenantId      String
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Human readable reference shown in the UI, for example TXN-2026-0312. Unique per tenant.
+  reference     String
+
+  mode          TradeMode
+  commodityId   String
+  commodity     Commodity      @relation(fields: [commodityId], references: [id])
+  commodityName String
+  grade         String?
+  quantity      Float
+  unit          String
+  counterparty  String
+  tradeDate     DateTime
+  notes         String         @default("")
+
+  // Owner-trader fields. Prices are per unit. Null until known.
+  buyPrice      Float?
+  sellPrice     Float?
+  capitalSource String?
+
+  // Broker field.
+  commission    Float?
+
+  paymentStatus  PaymentStatus  @default(UNPAID)
+  deliveryStatus DeliveryStatus @default(PENDING)
+
+  // statusOverride, when set, wins over the derived value. status is the effective lifecycle,
+  // kept in sync by the service so the dashboard can filter and group on it directly.
+  statusOverride Lifecycle?
+  status         Lifecycle      @default(PENDING)
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([tenantId, mode])
+  @@index([tenantId, status])
+  @@index([tenantId, commodityId])
+  @@index([tenantId, tradeDate])
+}
+
+// ---------------------------------------------------------------------------
+// M2 to M7. Cross references to commodity, counterparty, order, and lot are
+// stored as plain id columns plus name snapshots, queried through the scoped
+// client, so history stays readable and the model stays lean.
+// ---------------------------------------------------------------------------
+
+enum LeadSource {
+  WHATSAPP
+  EMAIL
+  PHONE
+  WALK_IN
+  OTHER
+}
+
+enum LeadStage {
+  LEAD
+  QUOTE_SENT
+  NEGOTIATING
+  CLOSED
+  PENDING
+  LOST
+}
+
+enum QuoteStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+enum OrderStatus {
+  OPEN
+  SOURCING
+  FULFILLED
+  INVOICED
+  CLOSED
+  CANCELLED
+}
+
+enum LotStatus {
+  IN_STOCK
+  PARTIAL
+  DISPATCHED
+}
+
+enum PurchasePayMethod {
+  MOBILE_MONEY
+  CASH
+  BANK
+}
+
+enum TripStatus {
+  LOADING
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+enum HaulageStatus {
+  REQUESTED
+  QUOTED
+  BOOKED
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+enum HaulingQuoteStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum ListingType {
+  BUY
+  SELL
+}
+
+enum ListingStatus {
+  OPEN
+  MATCHED
+  CLOSED
+}
+
+enum OfferStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PARTIAL
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum PaymentDirection {
+  IN
+  OUT
+}
+
+enum LedgerType {
+  REVENUE
+  COGS
+  EXPENSE
+}
+
+enum IntegrationKind {
+  WHATSAPP
+  EMAIL
+  MOBILE_MONEY
+  BANK
+  PRICE_FEED
+}
+
+enum PlatformRevenueSource {
+  MARKETPLACE_MARGIN
+  FREIGHT_COMMISSION
+  SUBSCRIPTION
+}
+
+enum DisputeStatus {
+  OPEN
+  RESOLVED
+}
+
+model Lead {
+  id             String     @id @default(cuid())
+  tenantId       String
+  tenant         Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientName     String
+  counterpartyId String?
+  commodityName  String?
+  source         LeadSource @default(WHATSAPP)
+  stage          LeadStage  @default(LEAD)
+  estimatedValue Float?
+  message        String     @default("")
+  notes          String     @default("")
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@index([tenantId])
+  @@index([tenantId, stage])
+}
+
+model Quote {
+  id             String      @id @default(cuid())
+  tenantId       String
+  tenant         Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reference      String
+  counterpartyId String?
+  clientName     String
+  status         QuoteStatus @default(DRAFT)
+  validUntil     DateTime?
+  deliveryTerms  String      @default("")
+  notes          String      @default("")
+  sentAt         DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  lines          QuoteLine[]
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([tenantId, status])
+}
+
+model QuoteLine {
+  id            String  @id @default(cuid())
+  tenantId      String
+  quoteId       String
+  quote         Quote   @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  commodityId   String?
+  commodityName String
+  grade         String?
+  quantity      Float
+  unit          String
+  unitPrice     Float
+
+  @@index([tenantId])
+  @@index([quoteId])
+}
+
+model Order {
+  id             String      @id @default(cuid())
+  tenantId       String
+  tenant         Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reference      String
+  counterpartyId String?
+  clientName     String
+  commodityId    String?
+  commodityName  String
+  grade          String?
+  quantity       Float
+  unit           String
+  agreedPrice    Float
+  status         OrderStatus @default(OPEN)
+  quoteId        String?
+  notes          String      @default("")
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([tenantId, status])
+}
+
+model InventoryLot {
+  id              String    @id @default(cuid())
+  tenantId        String
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reference       String
+  commodityId     String?
+  commodityName   String
+  grade           String?
+  location        String    @default("")
+  unit            String
+  netWeight       Float
+  remainingWeight Float
+  costPerUnit     Float
+  totalCost       Float
+  farmerId        String?
+  farmerName      String?
+  purchaseId      String?
+  status          LotStatus @default(IN_STOCK)
+  createdAt       DateTime  @default(now())
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([tenantId, commodityName])
+  @@index([tenantId, status])
+}
+
+model FarmerPurchase {
+  id            String            @id @default(cuid())
+  tenantId      String
+  tenant        Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reference     String
+  farmerId      String?
+  farmerName    String
+  commodityId   String?
+  commodityName String
+  grade         String?
+  grossWeight   Float
+  deductions    Float             @default(0)
+  netWeight     Float
+  unit          String
+  qualityReadings Json?
+  pricePerUnit  Float
+  totalCost     Float
+  payMethod     PurchasePayMethod @default(MOBILE_MONEY)
+  paid          Boolean           @default(false)
+  receiptRef    String?
+  location      String            @default("")
+  orderId       String?
+  createdAt     DateTime          @default(now())
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+}
+
+model Trip {
+  id              String     @id @default(cuid())
+  tenantId        String
+  tenant          Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reference       String
+  orderId         String?
+  transactionId   String?
+  commodityName   String
+  truck           String
+  driver          String
+  transporterName String     @default("")
+  freightRate     Float?
+  status          TripStatus @default(LOADING)
+  departureAt     DateTime?
+  etaAt           DateTime?
+  weighbridgeIn   Float?
+  weighbridgeOut  Float?
+  bagCount        Int?
+  totalWeightSent Float?
+  sealNumber      String?
+  receivedWeight  Float?
+  sealIntact      Boolean?
+  variance        Float?
+  actualFreight   Float?
+  tripExpenses    Float?
+  grnRef          String?
+  clientSignoff   String?
+  delay           String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  lots            TripLot[]
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([tenantId, status])
+}
+
+model TripLot {
+  id           String @id @default(cuid())
+  tenantId     String
+  tripId       String
+  trip         Trip   @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  lotId        String
+  lotReference String
+  weight       Float
+
+  @@index([tenantId])
+  @@index([tripId])
+}
+
+model HaulageRequest {
+  id              String         @id @default(cuid())
+  tenantId        String
+  tenant          Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reference       String
+  pickup          String
+  dropoff         String
+  commodityName   String
+  tonnage         Float
+  vehicleType     String
+  pickupDate      DateTime?
+  status          HaulageStatus  @default(REQUESTED)
+  transactionId   String?
+  commissionFeePct Float         @default(5)
+  chargeTo        String         @default("TRANSPORTER")
+  bookedQuoteId   String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  quotes          HaulingQuote[]
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([tenantId, status])
+}
+
+model HaulingQuote {
+  id              String             @id @default(cuid())
+  tenantId        String
+  requestId       String
+  request         HaulageRequest     @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  transporterName String
+  amount          Float
+  etaDays         Int?
+  note            String             @default("")
+  status          HaulingQuoteStatus @default(PENDING)
+  createdAt       DateTime           @default(now())
+
+  @@index([tenantId])
+  @@index([requestId])
+}
+
+model MarketplaceListing {
+  id            String             @id @default(cuid())
+  tenantId      String
+  tenant        Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ownerName     String
+  type          ListingType
+  commodityName String
+  grade         String?
+  quantity      Float
+  unit          String
+  price         Float
+  region        String             @default("")
+  note          String             @default("")
+  status        ListingStatus      @default(OPEN)
+  createdAt     DateTime           @default(now())
+  offers        MarketplaceOffer[]
+
+  @@index([status])
+  @@index([commodityName])
+  @@index([tenantId])
+}
+
+model MarketplaceOffer {
+  id           String             @id @default(cuid())
+  listingId    String
+  listing      MarketplaceListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  fromTenantId String
+  fromName     String
+  price        Float
+  quantity     Float
+  message      String             @default("")
+  status       OfferStatus        @default(PENDING)
+  createdAt    DateTime           @default(now())
+
+  @@index([listingId])
+  @@index([fromTenantId])
+}
+
+model MarketplaceDeal {
+  id             String   @id @default(cuid())
+  listingId      String?
+  commodityName  String
+  quantity       Float
+  unit           String
+  buyerTenantId  String
+  sellerTenantId String
+  buyPrice       Float
+  sellPrice      Float
+  platformMargin Float
+  createdAt      DateTime @default(now())
+
+  @@index([buyerTenantId])
+  @@index([sellerTenantId])
+}
+
+model TraderRating {
+  id            String   @id @default(cuid())
+  ratedTenantId String
+  byTenantId    String
+  stars         Int
+  comment       String   @default("")
+  createdAt     DateTime @default(now())
+
+  @@index([ratedTenantId])
+}
+
+model Dispute {
+  id               String        @id @default(cuid())
+  raisedByTenantId String
+  againstTenantId  String
+  listingId        String?
+  reason           String
+  status           DisputeStatus @default(OPEN)
+  createdAt        DateTime      @default(now())
+
+  @@index([againstTenantId])
+}
+
+model PricePoint {
+  id            String   @id @default(cuid())
+  tenantId      String?
+  tenant        Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  commodityName String
+  region        String   @default("")
+  date          DateTime
+  price         Float
+  source        String   @default("admin")
+  createdAt     DateTime @default(now())
+
+  @@index([commodityName, region, date])
+  @@index([tenantId])
+}
+
+model Invoice {
+  id             String        @id @default(cuid())
+  tenantId       String
+  tenant         Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reference      String
+  counterpartyId String?
+  clientName     String
+  orderId        String?
+  amount         Float
+  paidAmount     Float         @default(0)
+  status         InvoiceStatus @default(DRAFT)
+  dueDate        DateTime?
+  creditTerms    String        @default("")
+  notes          String        @default("")
+  sentAt         DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  lines          InvoiceLine[]
+  payments       Payment[]
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([tenantId, status])
+}
+
+model InvoiceLine {
+  id          String  @id @default(cuid())
+  tenantId    String
+  invoiceId   String
+  invoice     Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description String
+  quantity    Float
+  unit        String
+  unitPrice   Float
+
+  @@index([tenantId])
+  @@index([invoiceId])
+}
+
+model Payment {
+  id                String           @id @default(cuid())
+  tenantId          String
+  tenant            Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoiceId         String?
+  invoice           Invoice?         @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  purchaseId        String?
+  direction         PaymentDirection
+  amount            Float
+  method            String           @default("")
+  reference         String           @default("")
+  confirmedByUserId String?
+  createdAt         DateTime         @default(now())
+
+  @@index([tenantId])
+  @@index([invoiceId])
+}
+
+model LedgerEntry {
+  id          String     @id @default(cuid())
+  tenantId    String
+  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  date        DateTime
+  type        LedgerType
+  category    String
+  description String     @default("")
+  amount      Float
+  refEntity   String?
+  refId       String?
+  createdAt   DateTime   @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, type])
+}
+
+model BankStatement {
+  id         String          @id @default(cuid())
+  tenantId   String
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  fileName   String
+  account    String          @default("")
+  uploadedAt DateTime        @default(now())
+  lines      StatementLine[]
+
+  @@index([tenantId])
+}
+
+model StatementLine {
+  id          String           @id @default(cuid())
+  tenantId    String
+  statementId String
+  statement   BankStatement    @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  date        DateTime?
+  description String
+  amount      Float
+  direction   PaymentDirection
+  category    String           @default("Uncategorized")
+  matched     Boolean          @default(false)
+  flagged     Boolean          @default(false)
+  note        String           @default("")
+
+  @@index([tenantId])
+  @@index([statementId])
+}
+
+model IntegrationCredential {
+  id        String          @id @default(cuid())
+  tenantId  String
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  kind      IntegrationKind
+  label     String          @default("")
+  config    Json?
+  connected Boolean         @default(false)
+  updatedAt DateTime        @updatedAt
+
+  @@unique([tenantId, kind])
+  @@index([tenantId])
+}
+
+model PlatformLedgerEntry {
+  id            String                @id @default(cuid())
+  source        PlatformRevenueSource
+  amount        Float
+  refTenantId   String?
+  refTenantName String?
+  description   String                @default("")
+  createdAt     DateTime              @default(now())
+
+  @@index([source])
+}
